@@ -1,0 +1,43 @@
+pluginManagement {
+    buildscript {
+        repositories {
+            mavenCentral()
+            maven {
+                url = uri('https://storage.googleapis.com/r8-releases/raw')
+                content { includeModule('com.android.tools', 'r8') }
+            }
+        }
+        dependencies {
+            // The AGP default D8 predates Kotlin 2.4 metadata.
+            classpath 'com.android.tools:r8:9.1.29'
+        }
+    }
+    repositories {
+        google {
+            content {
+                includeGroupByRegex('com\\.android.*')
+                includeGroupByRegex('com\\.google.*')
+                includeGroupByRegex('androidx.*')
+            }
+        }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google {
+            content {
+                includeGroupByRegex('androidx\\..*')
+                includeGroup('com.android.tools.build')
+                includeModuleByRegex('com\\.android\\.tools', 'desugar_jdk_libs.*')
+            }
+        }
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'zheyou-majsoul-android'
+include ':app'

@@ -1,0 +1,382 @@
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/settings/BehaviourSettings.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/settings/BehaviourSettings.java
+@@ -24,7 +24,7 @@
+     @Key(doc = "同じ牌を手出しでもツモ切りでも切れるとき、どちらで切るか", value = "TSUMOGIRI") TwinDiscard twinDiscard) {
+ 
+   private static final BehaviourSettings DEFAULTS =
+-      Settings.section(BehaviourSettings.class, "behaviour", List.of()).value();
++      new BehaviourSettings(0.005, 0.0, TwinDiscard.TSUMOGIRI);
+ 
+   public BehaviourSettings {
+     Objects.requireNonNull(twinDiscard, "twinDiscard");
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/policy/Encoding.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/policy/Encoding.java
+@@ -236,7 +236,7 @@
+               "row holds " + plan.actions(row) + " actions, the request " + actions);
+         }
+         float[] scores = new float[actions];
+-        output.get(offset + plan.firstAction(row), scores);
++        output.duplicate().position(offset + plan.firstAction(row)).get(scores);
+         GreedyAnswer.write(
+             request,
+             scores,
+--- a/epsilon-prism-3p/src/main/java/com/epsilon/prism3p/input/InputSchema.java
++++ b/epsilon-prism-3p/src/main/java/com/epsilon/prism3p/input/InputSchema.java
+@@ -1007,19 +1007,19 @@
+     private static SchemaDigest digest() {
+       SchemaDigest digest = SchemaDigest.named("epsilon-prism-3p-input");
+       Map<Class<?>, Vocabulary<?>> valueTypes = new LinkedHashMap<>();
+-      for (Class<?> type : SchemaDigest.sorted(CategoryField.class.getPermittedSubclasses())) {
++      for (Class<?> type : SchemaDigest.sorted(new Class<?>[] {RoundField.class, SeatField.class, TileField.class, EventField.class, TransitionField.class})) {
+         appendBounded(digest, type, valueTypes);
+       }
+       appendBounded(digest, RelationAttribute.class, valueTypes);
+       valueTypes.values().forEach(digest::values);
+-      for (Class<?> type : SchemaDigest.sorted(ScalarField.class.getPermittedSubclasses())) {
++      for (Class<?> type : SchemaDigest.sorted(new Class<?>[] {RoundScalar.class, SeatScalar.class, EventScalar.class, TransitionScalar.class})) {
+         StringBuilder scalars = new StringBuilder();
+         for (Object constant : type.getEnumConstants()) {
+           scalars.append(constant).append('/').append(((ScalarField) constant).scale()).append(',');
+         }
+         digest.with(SchemaDigest.name(type), scalars);
+       }
+-      for (Class<?> type : SchemaDigest.sorted(ExactField.class.getPermittedSubclasses())) {
++      for (Class<?> type : SchemaDigest.sorted(new Class<?>[] {DiscardExact.class, WinExact.class, RiichiExact.class})) {
+         StringBuilder exact = new StringBuilder();
+         for (Object constant : type.getEnumConstants()) {
+           exact.append(constant).append('/').append(((ExactField) constant).scale()).append(',');
+--- a/epsilon-agent/src/main/java/com/epsilon/agent/runtime/NetworkDevices.java
++++ b/epsilon-agent/src/main/java/com/epsilon/agent/runtime/NetworkDevices.java
+@@ -53,7 +53,7 @@
+   }
+ 
+   public Device primary() {
+-    return devices.getFirst();
++    return devices.get(0);
+   }
+ 
+   public Device get(int index) {
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/model/NetworkInputs.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/model/NetworkInputs.java
+@@ -126,8 +126,11 @@
+     Map<Tensor, ByteBuffer> sections = new EnumMap<>(Tensor.class);
+     for (Tensor tensor : Tensor.values()) {
+       int bytes = plan.count(tensor.axis()) * format.width(tensor) * tensor.element().bytes();
+-      sections.put(
+-          tensor, batch.blob().slice(plan.offset(tensor), bytes).order(ByteOrder.LITTLE_ENDIAN));
++      int offset = plan.offset(tensor);
++      ByteBuffer range = batch.blob().duplicate();
++      range.position(offset);
++      range.limit(offset + bytes);
++      sections.put(tensor, range.slice().order(ByteOrder.LITTLE_ENDIAN));
+     }
+     return of(
+         manager,
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/policy/NetworkPolicy.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/policy/NetworkPolicy.java
+@@ -105,7 +105,7 @@
+     this.runtime = runtime;
+     this.maxBatch = maxBatch;
+     this.encoder = encoder;
+-    if (!devices.getFirst().device().isGpu()) {
++    if (!devices.get(0).device().isGpu()) {
+       registration = null;
+       return;
+     }
+@@ -161,14 +161,14 @@
+     NetworkRuntime.initialize();
+     PrismShape shape = PrismNetwork.readShape(model);
+     InputFormat format = PrismNetwork.readFormat(model);
+-    InferencePath path = inference.resolve(devices.getFirst(), shape);
++    InferencePath path = inference.resolve(devices.get(0), shape);
+     if (path != inference) {
+       LOG.info(
+           "PRISM policy v{}: {} inference does not run {} on {}; using {}",
+           params.version(),
+           inference,
+           shape,
+-          devices.getFirst(),
++          devices.get(0),
+           path);
+     }
+     return switch (path) {
+@@ -181,7 +181,7 @@
+               maxBatch,
+               precision,
+               PriorSettings.STANDARD,
+-              BatchEncoder.eagerBudget(devices.getFirst(), runtime));
++              BatchEncoder.eagerBudget(devices.get(0), runtime));
+       case HIP -> {
+         if (precision != Precision.BFLOAT16) {
+           throw new IllegalArgumentException("PRISM's native kernels compute in BFLOAT16, not " + precision);
+@@ -406,7 +406,7 @@
+     Encoding encoding = encoder.acquire(rows);
+     try {
+       encoder.encode(encoding, null).join();
+-      encoding.answer(devices.getFirst().score(encoding), prior);
++      encoding.answer(devices.get(0).score(encoding), prior);
+       answered(encoding);
+       return CompletableFuture.completedFuture(null);
+     } catch (RuntimeException | Error failure) {
+--- a/epsilon-agent/src/main/java/com/epsilon/agent/observe/ObservationSchema.java
++++ b/epsilon-agent/src/main/java/com/epsilon/agent/observe/ObservationSchema.java
+@@ -221,7 +221,7 @@
+     digest.layout(header).layout(seat).layout(hand).layout(event).layout(discard).layout(meld);
+     digest.layout(legal).layout(callDiscard).layout(win);
+     Map<Class<?>, Vocabulary<?>> values = new LinkedHashMap<>();
+-    for (Class<?> type : SchemaDigest.sorted(Field.class.getPermittedSubclasses())) {
++    for (Class<?> type : SchemaDigest.sorted(new Class<?>[] {HeaderBits.class, SeatBits.class, HandBits.class, EventBits.class, DiscardBits.class, MeldBits.class, LegalBits.class, CallDiscardBits.class, WinBits.class})) {
+       for (Object constant : type.getEnumConstants()) {
+         Vocabulary<?> vocabulary = ((Field) constant).width(variant).values();
+         if (vocabulary != null) {
+--- a/epsilon-agent/src/main/java/com/epsilon/agent/policy/PolicyOptions.java
++++ b/epsilon-agent/src/main/java/com/epsilon/agent/policy/PolicyOptions.java
+@@ -28,7 +28,7 @@
+         Kernels kernels) {
+ 
+   private static final PolicyOptions DEFAULTS =
+-      Settings.section(PolicyOptions.class, "policy", List.of()).value();
++      new PolicyOptions("cpu", Precision.FLOAT32, 8, Kernels.EAGER);
+ 
+   public PolicyOptions {
+     Objects.requireNonNull(device, "device");
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/model/ReadingHeads.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/model/ReadingHeads.java
+@@ -116,7 +116,7 @@
+   private static String camel(ReadingTarget target) {
+     StringBuilder name = new StringBuilder();
+     for (String word : target.name().toLowerCase(Locale.ROOT).split("_")) {
+-      name.append(name.isEmpty() ? word : Character.toUpperCase(word.charAt(0)) + word.substring(1));
++      name.append((name.length() == 0) ? word : Character.toUpperCase(word.charAt(0)) + word.substring(1));
+     }
+     return name.toString();
+   }
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/model/RmsNorm.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/model/RmsNorm.java
+@@ -37,7 +37,7 @@
+    * @param shape ネットワークの形
+    */
+   public RmsNorm(PrismShape shape) {
+-    if (shape.layers().getLast().ffn() instanceof HipFfn.Typed) {
++    if (shape.layers().get(shape.layers().size() - 1).ffn() instanceof HipFfn.Typed) {
+       gain = null;
+       contextGain = gain("contextGain", shape.hidden());
+       tileGain = gain("tileGain", shape.hidden());
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/rows/RowCodec.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/rows/RowCodec.java
+@@ -235,7 +235,7 @@
+       throw new IOException("Corrupt row frame header");
+     }
+     byte[] index = new byte[INDEX_BYTES];
+-    header.get(INDEX_OFFSET, index);
++    header.duplicate().position(INDEX_OFFSET).get(index);
+     byte[] compressed = new byte[compressedLength];
+     source.position(source.position() + FRAME_HEADER).get(compressed);
+     byte[] raw;
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/input/RowInputWriter.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/input/RowInputWriter.java
+@@ -453,8 +453,7 @@
+       relation.copyTo(bytes, relations, plan.tokenStart(axis) + rowTokenStart(axis), token, count);
+       token += count;
+     }
+-    bytes.put(
+-        plan.offset(Tensor.TRANSITION_CODE) + firstTransition * keys, codes, 0, transitions * keys);
++    bytes.duplicate().position(plan.offset(Tensor.TRANSITION_CODE) + firstTransition * keys).put( codes, 0, transitions * keys);
+     put(shorts, Tensor.ROUND_SCALAR, row * roundScalarWidth, roundScalars, roundScalarWidth);
+     put(shorts, Tensor.SEAT_SCALAR, seats * row * seatScalarWidth, seatScalars, seatScalars.length);
+     put(
+@@ -469,22 +468,19 @@
+         firstTransition * transitionScalarWidth,
+         transitionScalars,
+         transitions * transitionScalarWidth);
+-    floats.put(
+-        element(Tensor.DISCARD_EXACT) + firstTransition * discardExactWidth,
++    floats.duplicate().position(element(Tensor.DISCARD_EXACT) + firstTransition * discardExactWidth).put(
+         discardExact,
+         0,
+         transitions * discardExactWidth);
+-    floats.put(
+-        element(Tensor.ACTION_EXACT) + firstAction * actionExactWidth,
++    floats.duplicate().position(element(Tensor.ACTION_EXACT) + firstAction * actionExactWidth).put(
+         actionExact,
+         0,
+         actions * actionExactWidth);
+-    ints.put(
+-        element(Tensor.ACTION_COLUMN) + firstAction * actionColumnWidth,
++    ints.duplicate().position(element(Tensor.ACTION_COLUMN) + firstAction * actionColumnWidth).put(
+         actionColumns,
+         0,
+         actions * actionColumnWidth);
+-    ints.put(element(Tensor.ROW_COLUMN) + row * rowColumnWidth, rowColumns, 0, rowColumnWidth);
++    ints.duplicate().position(element(Tensor.ROW_COLUMN) + row * rowColumnWidth).put( rowColumns, 0, rowColumnWidth);
+     for (int action = 0; action < actions; action++) {
+       batch.prior(firstAction + action, priorShanten[action], priorUkeire[action]);
+     }
+@@ -555,7 +551,7 @@
+   }
+ 
+   private void put(ShortBuffer target, Tensor tensor, int at, short[] draft, int length) {
+-    target.put(element(tensor) + at, draft, 0, length);
++    target.duplicate().position(element(tensor) + at).put( draft, 0, length);
+   }
+ 
+   private static float finite(float value) {
+@@ -742,7 +738,7 @@
+ 
+     /** 下書きの {@code from} 番目から {@code count} 個のトークンを、領域の {@code at} 番目のトークンの位置へ写す。 */
+     private void copyTo(ByteBuffer target, int offset, int at, int from, int count) {
+-      target.put(offset + at * width, draft, from * width, count * width);
++      target.duplicate().position(offset + at * width).put( draft, from * width, count * width);
+     }
+   }
+ }
+--- a/epsilon-agent/src/main/java/com/epsilon/agent/observe/codec/SchemaDigest.java
++++ b/epsilon-agent/src/main/java/com/epsilon/agent/observe/codec/SchemaDigest.java
+@@ -6,7 +6,7 @@
+ import java.security.NoSuchAlgorithmException;
+ import java.util.Arrays;
+ import java.util.Comparator;
+-import java.util.HexFormat;
++
+ import java.util.Objects;
+ 
+ /**
+@@ -56,7 +56,13 @@
+   public String hex() {
+     try {
+       byte[] hash = MessageDigest.getInstance("SHA-256").digest(text.toString().getBytes(StandardCharsets.UTF_8));
+-      return HexFormat.of().formatHex(hash, 0, FINGERPRINT_BYTES);
++      StringBuilder encoded = new StringBuilder(FINGERPRINT_BYTES * 2);
++      for (int i = 0; i < FINGERPRINT_BYTES; i++) {
++        int value = hash[i] & 0xff;
++        encoded.append(Character.forDigit(value >>> 4, 16));
++        encoded.append(Character.forDigit(value & 15, 16));
++      }
++      return encoded.toString();
+     } catch (NoSuchAlgorithmException impossible) {
+       throw new IllegalStateException("SHA-256 is unavailable", impossible);
+     }
+--- a/epsilon-mahjong/src/main/java/com/epsilon/mahjong/shape/ShapeTables.java
++++ b/epsilon-mahjong/src/main/java/com/epsilon/mahjong/shape/ShapeTables.java
+@@ -129,7 +129,12 @@
+       }
+       ByteBuffer data;
+       try (GZIPInputStream unzipped = new GZIPInputStream(resource)) {
+-        data = ByteBuffer.wrap(unzipped.readAllBytes());
++        var output = new java.io.ByteArrayOutputStream();
++        byte[] buffer = new byte[8192];
++        for (int count; (count = unzipped.read(buffer)) != -1; ) {
++          output.write(buffer, 0, count);
++        }
++        data = ByteBuffer.wrap(output.toByteArray());
+       }
+       ShapeSection[] sections = ShapeSection.values();
+       Object[] arrays = new Object[sections.length];
+@@ -147,7 +152,9 @@
+ 
+   private static Object readSection(ByteBuffer data, Element element) {
+     int length = data.getInt();
+-    ByteBuffer body = data.slice(data.position(), length * element.bytes());
++    ByteBuffer segment = data.slice();
++    segment.limit(length * element.bytes());
++    ByteBuffer body = segment.slice();
+     data.position(data.position() + body.capacity());
+     return switch (element) {
+       case BYTE -> {
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/model/Staging.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/model/Staging.java
+@@ -40,19 +40,19 @@
+     LONG(DataType.INT64) {
+       @Override
+       void writeArray(ByteBuffer buffer, int offset, Object values) {
+-        buffer.asLongBuffer().put(offset, (long[]) values);
++        buffer.asLongBuffer().position(offset).put((long[]) values);
+       }
+     },
+     INT(DataType.INT32) {
+       @Override
+       void writeArray(ByteBuffer buffer, int offset, Object values) {
+-        buffer.asIntBuffer().put(offset, (int[]) values);
++        buffer.asIntBuffer().position(offset).put((int[]) values);
+       }
+     },
+     FLOAT(DataType.FLOAT32) {
+       @Override
+       void writeArray(ByteBuffer buffer, int offset, Object values) {
+-        buffer.asFloatBuffer().put(offset, (float[]) values);
++        buffer.asFloatBuffer().position(offset).put((float[]) values);
+       }
+     },
+     BOOLEAN(DataType.BOOLEAN) {
+@@ -92,7 +92,7 @@
+     /** 領域の値（Java の配列か、ネイティブのバイト順のバイト列）を、バッファの {@code offset} 番目の要素の位置から書く。 */
+     final void write(ByteBuffer buffer, int offset, Object values) {
+       if (values instanceof ByteBuffer bytes) {
+-        buffer.put(offset * type.getNumOfBytes(), bytes, bytes.position(), bytes.remaining());
++        buffer.duplicate().position(offset * type.getNumOfBytes()).put(bytes.duplicate());
+       } else {
+         writeArray(buffer, offset, values);
+       }
+--- a/epsilon-prism/src/main/java/com/epsilon/prism/auxiliary/TargetSchema.java
++++ b/epsilon-prism/src/main/java/com/epsilon/prism/auxiliary/TargetSchema.java
+@@ -185,7 +185,7 @@
+             .values(Vocabulary.of(Condition.class, variant))
+             .values(Vocabulary.of(ReadingCondition.class, variant))
+             .with("candidateRoles", roles);
+-    for (Class<?> type : SchemaDigest.sorted(Target.class.getPermittedSubclasses())) {
++    for (Class<?> type : SchemaDigest.sorted(new Class<?>[] {CandidateTarget.class, ReadingTarget.class})) {
+       StringBuilder targets = new StringBuilder();
+       for (Object constant : type.getEnumConstants()) {
+         Target target = (Target) constant;
+--- a/epsilon-agent/src/main/java/com/epsilon/agent/observe/codec/UnsignedBytes.java
++++ b/epsilon-agent/src/main/java/com/epsilon/agent/observe/codec/UnsignedBytes.java
+@@ -1,45 +1,20 @@
+ package com.epsilon.agent.observe.codec;
+ 
+-import java.lang.invoke.MethodHandles;
+-import java.lang.invoke.VarHandle;
+-import java.nio.ByteOrder;
+ import java.util.Objects;
+ 
+-/**
+- * 符号なしのバイト（u8）の列を、添字ごとの上限と比べる。ネットワークの入力に使うキーのコードが、語彙の中でそのキーに割り当てた
+- * 範囲に収まるかを、行ごとに 1 回確かめるのに使う。メモリは確保しない。
+- *
+- * <p>8 バイトを 1 つの {@code long} にまとめて比べる。各バイトの最上位のビットを落としてから、上限から値を引く。こうすると
+- * バイトをまたぐ桁借りは起きない。最上位のビットの桁借りの式で、値が上限より大きいバイトを見つける。
+- */
++/** Compares each unsigned input byte with the corresponding vocabulary limit. */
+ public final class UnsignedBytes {
+-
+-  private static final VarHandle WORDS = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+-  private static final long HIGH_BITS = 0x8080808080808080L;
+-  private static final int BYTE_MASK = 0xFF;
+ 
+   private UnsignedBytes() {}
+ 
+-  /**
+-   * 先頭から指定した数の値が全て、同じ添字の上限以下なら true（符号なしで比べる）。どちらかの配列が指定した数より短ければ
+-   * IndexOutOfBoundsException を投げる。
+-   */
+   public static boolean allAtMost(byte[] values, byte[] limits, int length) {
+     Objects.checkFromIndexSize(0, length, values.length);
+     Objects.checkFromIndexSize(0, length, limits.length);
+-    long above = 0L;
+-    int index = 0;
+-    for (; index + Long.BYTES <= length; index += Long.BYTES) {
+-      long value = (long) WORDS.get(values, index);
+-      long limit = (long) WORDS.get(limits, index);
+-      long difference = (limit | HIGH_BITS) - (value & ~HIGH_BITS);
+-      above |= (~limit & value | ~(limit ^ value) & ~difference) & HIGH_BITS;
+-    }
+-    for (; index < length; index++) {
+-      if ((values[index] & BYTE_MASK) > (limits[index] & BYTE_MASK)) {
++    for (int index = 0; index < length; index++) {
++      if (Byte.toUnsignedInt(values[index]) > Byte.toUnsignedInt(limits[index])) {
+         return false;
+       }
+     }
+-    return above == 0L;
++    return true;
+   }
+ }

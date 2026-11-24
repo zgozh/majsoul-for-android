@@ -1,0 +1,121 @@
+--- a/engines/pytorch/pytorch-native/CMakeLists.txt
++++ b/engines/pytorch/pytorch-native/CMakeLists.txt
+@@ -297,7 +297,7 @@
+             PROPERTY IMPORTED_LOCATION
+             ${CMAKE_CURRENT_SOURCE_DIR}/libtorch_android/${ANDROID_ABI}/lib/${name}.a)
+     endfunction(import_static_lib)
+-    list(APPEND LIBS libtorch libtorch_cpu libc10 libnnpack libXNNPACK libpytorch_qnnpack libpthreadpool libeigen_blas libcpuinfo libclog libVulkanWrapper)
++    list(APPEND LIBS libtorch libtorch_cpu libc10 libnnpack libXNNPACK libmicrokernels-prod libfmt libcpuinfo_internals libpytorch_qnnpack libpthreadpool libeigen_blas libcpuinfo libclog libVulkanWrapper)
+     foreach(lib IN LISTS LIBS)
+         import_static_lib(${lib})
+     endforeach()
+@@ -312,6 +312,9 @@
+         libc10
+         libnnpack
+         libXNNPACK
++        libmicrokernels-prod
++        libfmt
++        libcpuinfo_internals
+         libpytorch_qnnpack
+         libpthreadpool
+         libeigen_blas
+--- a/engines/pytorch/pytorch-native/src/main/native/djl_pytorch_accelerator.cc
++++ b/engines/pytorch/pytorch-native/src/main/native/djl_pytorch_accelerator.cc
+@@ -752,6 +752,9 @@
+ }
+ 
+ DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
++#ifdef __ANDROID__
++  TORCH_CHECK(false, "Device memory statistics require an accelerator");
++#else
+   InitializeAccelerator();
+   c10::CachingDeviceAllocator::DeviceStats stats;
+ #if DJL_HAS_DEVICE_ACCELERATOR
+@@ -765,18 +768,22 @@
+   const auto& active = stats.active_bytes[aggregate];
+   return {allocated.current, allocated.peak, reserved.current, reserved.peak, active.current, active.peak,
+       stats.inactive_split_bytes[aggregate].current, stats.num_alloc_retries, stats.num_ooms};
++#endif
+ }
+ 
+ void ResetPeakMemoryStats(c10::DeviceIndex device) {
++#ifndef __ANDROID__
+   InitializeAccelerator();
+ #if DJL_HAS_DEVICE_ACCELERATOR
+   at::accelerator::resetPeakStats(device);
+ #else
+   at::getDeviceAllocator(c10::DeviceType::CUDA)->resetPeakStats(device);
+ #endif
++#endif
+ }
+ 
+ void EmptyCache() {
++#ifndef __ANDROID__
+   if (!IsAvailable()) {
+     return;
+   }
+@@ -785,6 +792,7 @@
+ #else
+   at::getDeviceAllocator(c10::DeviceType::CUDA)->emptyCache();
+ #endif
++#endif
+ }
+ 
+ }  // namespace accel
+--- a/engines/pytorch/pytorch-native/src/main/native/djl_pytorch_layer_norm.cc
++++ b/engines/pytorch/pytorch-native/src/main/native/djl_pytorch_layer_norm.cc
+@@ -46,11 +46,7 @@
+     at::IntArrayRef normalized_shape, const torch::Tensor& weight,
+     const torch::Tensor& bias, double epsilon,
+     torch::ScalarType converted_type) {
+-  auto normalized = torch::nn::functional::layer_norm(input,
+-      torch::nn::functional::LayerNormFuncOptions(normalized_shape.vec())
+-          .weight(weight)
+-          .bias(bias)
+-          .eps(epsilon));
++  auto normalized = at::layer_norm(input, normalized_shape, weight, bias, epsilon);
+   auto converted = normalized.scalar_type() == converted_type
+       ? normalized.clone()
+       : normalized.to(converted_type);
+@@ -61,11 +57,7 @@
+     const torch::Tensor& update, at::IntArrayRef normalized_shape,
+     const torch::Tensor& weight, const torch::Tensor& bias, double epsilon) {
+   auto summed_residual = residual.add(update);
+-  auto normalized = torch::nn::functional::layer_norm(summed_residual,
+-      torch::nn::functional::LayerNormFuncOptions(normalized_shape.vec())
+-          .weight(weight)
+-          .bias(bias)
+-          .eps(epsilon));
++  auto normalized = at::layer_norm(summed_residual, normalized_shape, weight, bias, epsilon);
+   return {std::move(normalized), std::move(summed_residual)};
+ }
+ 
+@@ -184,11 +176,7 @@
+     return rocm::autocast_layer_norm(input, weight, bias, static_cast<float>(epsilon));
+   }
+ #endif
+-  return torch::nn::functional::layer_norm(input,
+-      torch::nn::functional::LayerNormFuncOptions(normalized_shape.vec())
+-          .weight(weight)
+-          .bias(bias)
+-          .eps(epsilon));
++  return at::layer_norm(input, normalized_shape, weight, bias, epsilon);
+ }
+ 
+ std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
+--- a/engines/pytorch/pytorch-native/src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc
++++ b/engines/pytorch/pytorch-native/src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc
+@@ -458,11 +458,8 @@
+ #endif
+   {
+     residual_ptr->add_(*update_ptr);
+-    result = torch::nn::functional::layer_norm(
+-        *residual_ptr, torch::nn::functional::LayerNormFuncOptions({residual_ptr->size(-1)})
+-                           .weight(*weight_ptr)
+-                           .bias(*bias_ptr)
+-                           .eps(jepsilon));
++    result = at::layer_norm(
++        *residual_ptr, {residual_ptr->size(-1)}, *weight_ptr, *bias_ptr, jepsilon);
+   }
+   const auto* result_ptr = new torch::Tensor(std::move(result));
+   return reinterpret_cast<uintptr_t>(result_ptr);

@@ -1,0 +1,74 @@
+plugins {
+    id 'com.android.application' version '8.13.2'
+    id 'org.jetbrains.kotlin.android' version '2.4.20'
+}
+
+def localModels = !providers.gradleProperty('windowsInference').map { it.toBoolean() }.getOrElse(false)
+def epsilonArtifacts = rootProject.layout.buildDirectory.dir('epsilon-android').get().asFile
+def mortalArtifacts = rootProject.layout.buildDirectory.dir('mortal-android').get().asFile
+
+if (!localModels) {
+    layout.buildDirectory.set(rootProject.layout.buildDirectory.dir('app-windows-inference'))
+}
+if (localModels && (!new File(epsilonArtifacts, 'epsilon.jar').isFile()
+        || !new File(mortalArtifacts, 'onnxruntime-android.aar').isFile())) {
+    throw new GradleException('Prepare both Android models using the scripts in the README.')
+}
+
+android {
+    namespace 'com.zheyou.majsoul'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.zheyou.majsoul'
+        minSdk localModels ? 26 : 23
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-dev'
+        buildConfigField 'boolean', 'LOCAL_MODELS', localModels.toString()
+        if (localModels) {
+            ndk.abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+    sourceSets.main.java.srcDir(localModels ? 'src/localModels/java' : 'src/windowsInference/java')
+    if (localModels) {
+        sourceSets.main.assets.srcDir(new File(epsilonArtifacts, 'assets'))
+        sourceSets.main.jniLibs.srcDir(new File(epsilonArtifacts, 'jniLibs'))
+        sourceSets.main.assets.srcDir(new File(mortalArtifacts, 'assets'))
+        sourceSets.main.jniLibs.srcDir(new File(mortalArtifacts, 'jniLibs'))
+        packaging.jniLibs.useLegacyPackaging = true
+    }
+
+    compileOptions {
+        coreLibraryDesugaringEnabled localModels
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+}
+
+dependencies {
+    if (localModels) {
+        implementation files(new File(epsilonArtifacts, 'epsilon.jar'))
+        implementation files(new File(mortalArtifacts, 'onnxruntime-android.aar'))
+        coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs_nio:2.1.5'
+    }
+    implementation 'androidx.core:core:1.18.0'
+    implementation 'androidx.webkit:webkit:1.14.0'
+    constraints {
+        // Match the Android dependencies already used by the local SDK setup.
+        implementation 'androidx.annotation:annotation:1.10.0'
+        implementation 'androidx.annotation:annotation-experimental:1.5.0'
+        implementation 'androidx.collection:collection:1.6.0'
+        implementation 'androidx.lifecycle:lifecycle-runtime:2.10.0'
+        implementation 'androidx.startup:startup-runtime:1.2.0'
+        implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
+    }
+}
